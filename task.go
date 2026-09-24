@@ -1,5 +1,8 @@
 package task_queue
-import "github.com/google/uuid"
+import (
+	"github.com/google/uuid"
+	"time"
+)
 
 type TaskState uint8
 
@@ -32,7 +35,7 @@ func (s TaskState) String() string {
 type Task struct {
 	ID uuid.UUID  // UUID identifier for the job
 	IdempotencyKey string
-	Payload Payload
+	Payload []byte
 	Status TaskState 
 	Retries int
 	Priority int // Consider how we can define this (this is for priority queues since some jobs are more important than others)
