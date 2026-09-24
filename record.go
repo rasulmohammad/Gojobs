@@ -1,6 +1,8 @@
 package task_queue
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -47,12 +49,78 @@ type EnqueuePayload struct {
     Priority       int
 }
 
+// Encoding only fields. General rule, if the size of a field is fixed, no prefix needed. If not, add a prefix
+// We encode in the order as defined in the struct
 func encodeEnqueuePayload(p EnqueuePayload) ([]byte, error) {
-	panic("TODO: implement in 2.1")
+	var buf bytes.Buffer
+	var scratch [8]byte
+
+	// buf only takes a slice. ID is already [16]byte so no conversion necessary here
+	buf.Write(p.ID[:])
+
+	// IdempotencyKey not fixed length, which means we need to length prefix it. 32 bits/8 bytes is more than enough
+	IdempotencyKeyLength := uint32(len(p.IdempotencyKey))
+	binary.BigEndian.PutUint32(scratch[:4], IdempotencyKeyLength)
+	buf.Write(scratch[:4]) // len prefix
+	buf.WriteString(p.IdempotencyKey)
+
+	// Payload not fixed length, we need to length prefix.
+	PayloadLength := uint32(len(p.Payload))
+	binary.BigEndian.PutUint32(scratch[:4], PayloadLength)
+	buf.Write(scratch[:4])
+	buf.Write(p.Payload)
+
+	// time.Time cant be serialized directly (wall clock, monotonic reading, and a *Location pointer built in)
+	// Use nanoseconds unix time instead -- need 8 bytes for this since 4 bytes max < current nanoseconds 
+	EnqueuedAtNanoseconds := uint64(p.EnqueuedAt.UnixNano())
+	binary.BigEndian.PutUint64(scratch[:8], EnqueuedAtNanoseconds)
+	buf.Write(scratch[:8])
+
+	// Known value, 4 bytes. Assumes priority is >= 0 / non-negative
+	binary.BigEndian.PutUint32(scratch[:4], uint32(p.Priority))
+	buf.Write(scratch[:4])
+
+	// buf.Bytes() returns everything we appended, in order.
+	return buf.Bytes(), nil
 }
 
 func decodeEnqueuePayload(b []byte) (EnqueuePayload, error) {
-	panic("TODO: implement in 2.1")
+	// A running offset for clearer naming convention
+	bytePos := 0
+	//First 16 bytes is ID:
+	ID, err := uuid.FromBytes(b[:16])
+	if err != nil{
+		return EnqueuePayload{}, err
+	}
+	bytePos += 16
+
+	//Idempotency key
+	IdempotencyKeyLength := int(binary.BigEndian.Uint32(b[bytePos : bytePos + 4]))
+	bytePos += 4
+	IdempotencyKey := string(b[bytePos : bytePos + IdempotencyKeyLength])
+	bytePos += IdempotencyKeyLength
+
+	//Payload
+	PayloadLength := int(binary.BigEndian.Uint32(b[bytePos : bytePos + 4]))
+	bytePos += 4
+	Payload := b[bytePos : bytePos + PayloadLength]
+	bytePos += PayloadLength
+
+	// Enqueued at
+	EnqueuedAtNanoseconds := int64(binary.BigEndian.Uint64(b[bytePos : bytePos + 8]))
+	bytePos += 8
+	EnqueuedAt := time.Unix(0, EnqueuedAtNanoseconds).UTC()
+
+	//Priority
+	Priority := int(binary.BigEndian.Uint32(b[bytePos : bytePos + 4]))
+
+	return EnqueuePayload{
+		ID: ID,
+		IdempotencyKey: IdempotencyKey,
+		Payload: Payload,
+		EnqueuedAt: EnqueuedAt,
+		Priority: Priority,
+	}, nil
 }
 
 
@@ -63,7 +131,24 @@ type DequeuePayload struct {
 }
 
 func encodeDequeuePayload(p DequeuePayload) ([]byte, error) {
-	panic("TODO: implement in 2.1")
+	var buf bytes.Buffer
+	var scratch [8]byte
+
+	//ID
+	buf.Write(p.ID[:])
+
+	//LeaseUntil
+	LeaseUntilNanoseconds := uint64(p.LeaseUntil.UnixNano())
+	binary.BigEndian.PutUint64(scratch[:8], LeaseUntilNanoseconds)
+	buf.Write(scratch[:8])
+
+	//Owner
+	OwnerLength := uint32(len(p.Owner))
+	binary.BigEndian.PutUint32(scratch[:4], OwnerLength)
+	buf.Write(scratch[:4])
+	buf.WriteString(p.Owner)
+
+	return buf.Bytes(), nil
 }
 
 func decodeDequeuePayload(b []byte) (DequeuePayload, error) {
@@ -76,7 +161,10 @@ type AckPayload struct {
 }
 
 func encodeAckPayload(p AckPayload) ([]byte, error) {
-	panic("TODO: implement in 2.1")
+	var buf bytes.Buffer
+	//ID
+	buf.Write(p.ID[:])
+	return buf.Bytes(), nil
 }
 
 func decodeAckPayload(b []byte) (AckPayload, error) {
@@ -88,7 +176,10 @@ type RetryPayload struct {
 }
 
 func encodeRetryPayload(p RetryPayload) ([]byte, error) {
-	panic("TODO: implement in 2.1")
+	var buf bytes.Buffer
+	//ID
+	buf.Write(p.ID[:])
+	return buf.Bytes(), nil
 }
 
 func decodeRetryPayload(b []byte) (RetryPayload, error) {
@@ -100,7 +191,10 @@ type DeadPayload struct {
 }
 
 func encodeDeadPayload(p DeadPayload) ([]byte, error) {
-	panic("TODO: implement in 2.1")
+	var buf bytes.Buffer
+	//ID
+	buf.Write(p.ID[:])
+	return buf.Bytes(), nil
 }
 
 func decodeDeadPayload(b []byte) (DeadPayload, error) {
