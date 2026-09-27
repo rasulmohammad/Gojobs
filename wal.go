@@ -4,11 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"hash/crc32"
 	"io"
 	"os"
 )
+
+// errCorruptRecord marks a frame whose stored CRC doesn't match its bytes. In an
+// append-only, fsync'd log this only happens to the LAST record (a crash mid-append),
+// so Replay treats it as "the log ends here" rather than a fatal error.
+var errCorruptRecord = errors.New("decodeFrame: crc mismatch (corrupt record)")
 
 // This is the log manager. Owns file handle / how to append bytes. It is not an entry in the log
 type WAL struct {
@@ -79,14 +84,19 @@ func (w *WAL) Replay(apply func(record []byte) error) error {
 
 	r := bufio.NewReader(f)
 
-	// Look by decoding frame, if cursor hits the end, we have no more frames
+	// Decode records one at a time until the log ends.
 	for {
 		frame, err := decodeFrame(r)
-		if err == io.EOF {
-			break // Clean end - no more frames left
-		}
 		if err != nil {
-			return err // Real problem
+			// Three ways the log can "end": a clean EOF (no more records), a
+			// truncated final record (io.ErrUnexpectedEOF), or a bad CRC on the
+			// last record. Because the log is append-only and fsync'd, a crash can
+			// only tear the LAST record, so we stop cleanly and keep the good
+			// prefix. Anything else (a real read error) is surfaced.
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, errCorruptRecord) {
+				break
+			}
+			return err
 		}
 		if err := apply(frame); err != nil {
 			return err
@@ -143,7 +153,7 @@ func decodeFrame(r io.Reader) ([]byte, error) {
 
 	// Verify integrity: recompute the checksum and compare to the stored one.
 	if crc32.ChecksumIEEE(record) != storedCRC {
-		return nil, fmt.Errorf("decodeFrame: crc mismatch (corrupt record)")
+		return nil, errCorruptRecord
 	}
 
 	return record, nil

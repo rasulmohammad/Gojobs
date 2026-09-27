@@ -19,6 +19,7 @@ File layer (temp dir):
 import (
 	"bytes"
 	"io"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -263,4 +264,87 @@ func TestReplayEmptyWAL(t *testing.T) {
 	if called {
 		t.Error("apply was called on an empty WAL, want it never called")
 	}
+}
+
+// A truncated final record (a crash mid-append) must not fail replay: Replay stops
+// cleanly at the tear and keeps every record written before it.
+func TestReplayTruncatedTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "torn.wal")
+	w, err := OpenWAL(path)
+	if err != nil {
+		t.Fatalf("OpenWAL: %v", err)
+	}
+
+	records := [][]byte{[]byte("aaaa"), []byte("bbbb"), []byte("cccc")}
+	for _, rec := range records {
+		if _, err := w.Append(rec); err != nil {
+			t.Fatalf("Append(%q): %v", rec, err)
+		}
+	}
+
+	// Chop 2 bytes off the tail so the last frame's payload is incomplete.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if err := os.Truncate(path, info.Size()-2); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	got := replayAll(t, path)
+	if len(got) != 2 {
+		t.Fatalf("recovered %d records, want 2 (torn last record dropped)", len(got))
+	}
+	if string(got[0]) != "aaaa" || string(got[1]) != "bbbb" {
+		t.Errorf("recovered %q, want [aaaa bbbb]", got)
+	}
+}
+
+// A bad CRC on the last record (torn/corrupt tail) also stops replay cleanly and
+// keeps the good prefix, rather than failing to open the log.
+func TestReplayCorruptTailCRC(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corrupt.wal")
+	w, err := OpenWAL(path)
+	if err != nil {
+		t.Fatalf("OpenWAL: %v", err)
+	}
+	if _, err := w.Append([]byte("first")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := w.Append([]byte("second")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Flip the last byte (inside the last record's payload) to break its CRC.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	data[len(data)-1] ^= 0xFF
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got := replayAll(t, path)
+	if len(got) != 1 || string(got[0]) != "first" {
+		t.Fatalf("recovered %q, want [first]", got)
+	}
+}
+
+// replayAll reopens the WAL at path and returns every record Replay yields,
+// failing the test if Replay itself errors (a torn tail must not error).
+func replayAll(t *testing.T, path string) [][]byte {
+	t.Helper()
+	w, err := OpenWAL(path)
+	if err != nil {
+		t.Fatalf("reopen OpenWAL: %v", err)
+	}
+	var got [][]byte
+	if err := w.Replay(func(rec []byte) error {
+		got = append(got, append([]byte{}, rec...))
+		return nil
+	}); err != nil {
+		t.Fatalf("Replay returned error: %v, want nil (stop cleanly at torn tail)", err)
+	}
+	return got
 }
