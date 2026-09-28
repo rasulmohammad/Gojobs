@@ -2,6 +2,7 @@ package task_queue
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +16,7 @@ type Queue struct {
 	ready []*Task
 	index map[uuid.UUID]*Task
 	wal   *WAL
+	mu    sync.Mutex
 }
 
 // NewQueue opens (or creates) the WAL at walPath and returns a Queue backed by
@@ -97,7 +99,8 @@ func (q *Queue) applyRecord(record []byte) error {
 
 // Enqueue creates the task, stores it into the data structures
 func (q *Queue) Enqueue(payload []byte, idemKey string) (uuid.UUID, error) {
-
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	t := &Task{
 		ID:             uuid.New(),
 		IdempotencyKey: idemKey,
@@ -134,6 +137,8 @@ func (q *Queue) Enqueue(payload []byte, idemKey string) (uuid.UUID, error) {
 
 // Dequeue pops the task from the front of the ready slice & updates status. True = Successful pop
 func (q *Queue) Dequeue() (*Task, bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	// Ensuring non-empty array
 	if len(q.ready) > 0 {
 		t := q.ready[0]
@@ -154,6 +159,8 @@ func (q *Queue) Dequeue() (*Task, bool, error) {
 
 		// Updating task itself since map holds a pointer to it
 		t.Status = StateInflight
+		timeout := 30
+		t.LeaseUntil = time.Now().Add(time.Duration(timeout) * time.Second)
 
 		return t, true, nil
 	}
@@ -163,7 +170,8 @@ func (q *Queue) Dequeue() (*Task, bool, error) {
 
 // Consumer uses Ack() when successfully finishes the task
 func Ack(q *Queue, id uuid.UUID) error {
-
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	t, ok := q.index[id]
 	if !ok {
 		return fmt.Errorf("task %s not found", id)
@@ -184,8 +192,22 @@ func Ack(q *Queue, id uuid.UUID) error {
 	return nil
 }
 
-// Consumer uses Retry() when we are unsuccessful --> Allow retry
+// Consumer uses Retry() when we are unsuccessful --> Allow retry.
+// It owns the locking, then delegates the actual state transition to
+// retryLocked so the lease sweeper (which already holds q.mu) can reuse the
+// same logic without double-locking.
 func Retry(q *Queue, id uuid.UUID) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return retryLocked(q, id)
+}
+
+// retryLocked performs the retry state transition: bump Retries, write-ahead
+// the RETRY record, and put the task back on ready.
+// PRECONDITION: the caller already holds q.mu. It does NOT lock, so both Retry
+// (worker path) and the sweeper (already holding the lock) can call it without
+// deadlocking on the non-reentrant mutex.
+func retryLocked(q *Queue, id uuid.UUID) error {
 	t, ok := q.index[id]
 	if !ok {
 		return fmt.Errorf("task %s not found", id)
