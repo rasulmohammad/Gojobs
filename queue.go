@@ -13,24 +13,36 @@ import (
 // wal is the durable log; every mutation is appended (and fsync'd) here
 // before it becomes visible in memory.
 type Queue struct {
-	ready []*Task
-	index map[uuid.UUID]*Task
-	wal   *WAL
-	mu    sync.Mutex
+	ready             []*Task
+	index             map[uuid.UUID]*Task
+	indexOfInflight   map[uuid.UUID]*Task
+	wal               *WAL
+	mu                sync.Mutex
+	stop              chan struct{}  // Close() closes this to tell the sweeper to exit
+	wg                sync.WaitGroup // waits for the sweeper goroutine to actually finish
+	visibilityTimeout time.Duration  // how long a worker can hog a task for
+	sweepInterval     time.Duration  // how often the sweeper wakes to check for expired leases
 }
 
 // NewQueue opens (or creates) the WAL at walPath and returns a Queue backed by
 // it. The WAL is mandatory: without it the queue can't guarantee durability, so
 // construction fails if the log can't be opened.
-func NewQueue(walPath string) (*Queue, error) {
+// visibilityTimeout is how long a dequeued task's lease lasts; sweepInterval is
+// how often the background sweeper checks for expired leases. Tick more often
+// than the timeout so an expired lease isn't left sitting for long.
+func NewQueue(walPath string, visibilityTimeout, sweepInterval time.Duration) (*Queue, error) {
 	w, err := OpenWAL(walPath)
 	if err != nil {
 		return nil, err
 	}
 
 	q := &Queue{
-		index: make(map[uuid.UUID]*Task),
-		wal:   w,
+		index:             make(map[uuid.UUID]*Task),
+		indexOfInflight:   map[uuid.UUID]*Task{},
+		wal:               w,
+		stop:              make(chan struct{}),
+		visibilityTimeout: visibilityTimeout,
+		sweepInterval:     sweepInterval,
 	}
 
 	// Read each record from the loop with Replay().
@@ -41,6 +53,11 @@ func NewQueue(walPath string) (*Queue, error) {
 	if err = w.Replay(q.applyRecord); err != nil {
 		return nil, err
 	}
+
+	// Starts the background sweeper. Non-blocking, NewQueue continues to return q, nil instantly after runSweeper
+	// integer 1 here represents total amount of routines we want to wait for
+	q.wg.Add(1)
+	go q.runSweeper(q.sweepInterval)
 
 	return q, nil
 }
@@ -70,6 +87,8 @@ func (q *Queue) applyRecord(record []byte) error {
 	case OperationDequeue:
 		p := payload.(DequeuePayload)
 		q.index[p.ID].Status = StateInflight
+		// q.ready = q.ready[1:] // We cant just assume the dequeued task is at the front of the array due to the nature of log record writing. Currently fine because Dequeue isn't durable() but needs flagging
+		q.indexOfInflight[p.ID] = q.index[p.ID] // add to inflight
 	case OperationAck:
 		p := payload.(AckPayload)
 		delete(q.index, p.ID)
@@ -95,6 +114,52 @@ func (q *Queue) applyRecord(record []byte) error {
 	}
 
 	return nil
+}
+
+// Sweeper that scans through the existing set of in-flight tasks, checks if the task.LeaseUntil < time.Now() and Retries() it on true
+func (q *Queue) Sweeper() error {
+	q.mu.Lock() // Blocking queue operations while we move back into our queue / update state
+	defer q.mu.Unlock()
+
+	for id, t := range q.indexOfInflight {
+		if t.LeaseUntil.Before(time.Now()) {
+			err := retryLocked(q, id)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// runSweeper is the background goroutine that drives Sweeper on a fixed
+// interval. It loops until Close() closes q.stop, then returns so the goroutine
+// exits (no leak). It holds no lock itself; each Sweeper pass takes the lock.
+func (q *Queue) runSweeper(interval time.Duration) {
+	// Whenever runSweeper returns, it decrements back from 1 -> 0 (our total count of routines)
+	defer q.wg.Done()
+
+	// Drops 1 value into the channel (ticket.C) every interval X amount of seconds
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop() // turns off the ticker so we dont waste resources after sweeper is killed
+
+	for {
+		// We wait for one channel event to happen
+		select {
+		case <-ticker.C: // event was a tick
+			_ = q.Sweeper()
+		// We need to have a stopper for when we end the sweeper (or else we have a goroutine leak / zombie sweeper)
+		case <-q.stop: // event was our stop being closed
+			return
+		}
+	}
+}
+
+// Close actually stops our goroutines from processing, then waits for mid-process routines to finish. This is supposed to be invoked once we know we want to end the program / close queues, etc..
+func (q *Queue) Close() {
+	close(q.stop) // closes the channel stored in q.stop
+	q.wg.Wait()
 }
 
 // Enqueue creates the task, stores it into the data structures
@@ -144,23 +209,11 @@ func (q *Queue) Dequeue() (*Task, bool, error) {
 		t := q.ready[0]
 		q.ready = q.ready[1:]
 
-		// For now, we're not making dequeue durable
-		// if a process fails while we're in-flight, we'll just replay
-		// the task as ready
-		// fields, err := encodeDequeuePayload(DequeuePayload{ID: t.ID, LeaseUntil: t.LeaseUntil, Owner: t.Owner})
-		// if err != nil {
-		// 	return nil, false, err
-		// }
-
-		// _, err = q.wal.Append(fields)
-		// if err != nil {
-		// 	return nil, false, err
-		// }
-
 		// Updating task itself since map holds a pointer to it
 		t.Status = StateInflight
-		timeout := 30
-		t.LeaseUntil = time.Now().Add(time.Duration(timeout) * time.Second)
+		q.indexOfInflight[t.ID] = t
+
+		t.LeaseUntil = time.Now().Add(q.visibilityTimeout)
 
 		return t, true, nil
 	}
@@ -187,7 +240,8 @@ func Ack(q *Queue, id uuid.UUID) error {
 		return err
 	}
 	t.Status = StateDone
-	delete(q.index, id) // task is done; drop from lookup
+	delete(q.indexOfInflight, id) // No longer inflight
+	delete(q.index, id)           // task is done; drop from lookup
 
 	return nil
 }
@@ -213,8 +267,6 @@ func retryLocked(q *Queue, id uuid.UUID) error {
 		return fmt.Errorf("task %s not found", id)
 	}
 
-	t.Retries += 1
-
 	fields, err := encodeRetryPayload(RetryPayload{ID: id})
 	if err != nil {
 		return err
@@ -226,7 +278,9 @@ func retryLocked(q *Queue, id uuid.UUID) error {
 	}
 
 	t.Status = StateReady
+	t.Retries += 1
 
 	q.ready = append(q.ready, t)
+	delete(q.indexOfInflight, id)
 	return nil
 }

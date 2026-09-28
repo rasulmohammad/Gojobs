@@ -11,21 +11,41 @@ Tests to cover:
 
 import (
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 // newTestQueue creates a queue backed by a throwaway WAL and returns it plus the
-// path, so recovery tests can reopen the same log.
+// path, so recovery tests can reopen the same log. Both durations are huge so the
+// background sweeper never ticks and never reclaims during fast tests, leaving the
+// single-threaded assertions (and -race) untouched. The sweeper goroutine is
+// stopped at test end via t.Cleanup.
 func newTestQueue(t *testing.T) (*Queue, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "q.wal")
-	q, err := NewQueue(path)
+	q, err := NewQueue(path, time.Hour, time.Hour)
 	if err != nil {
 		t.Fatalf("NewQueue: %v", err)
 	}
+	t.Cleanup(func() { q.Close() })
 	return q, path
+}
+
+// reopenQueue reopens an existing WAL (simulated restart) and returns the rebuilt
+// queue. Like newTestQueue, it uses huge durations so the sweeper stays inert and
+// registers Close for cleanup.
+func reopenQueue(t *testing.T, path string) *Queue {
+	t.Helper()
+	q, err := NewQueue(path, time.Hour, time.Hour)
+	if err != nil {
+		t.Fatalf("reopen NewQueue: %v", err)
+	}
+	t.Cleanup(func() { q.Close() })
+	return q
 }
 
 // Enqueue: three tasks should land in both the ready slice and the index,
@@ -175,10 +195,7 @@ func TestRetryMissingKey(t *testing.T) {
 func TestRecoverEmpty(t *testing.T) {
 	_, path := newTestQueue(t)
 
-	q2, err := NewQueue(path)
-	if err != nil {
-		t.Fatalf("reopen NewQueue: %v", err)
-	}
+	q2 := reopenQueue(t, path)
 	if len(q2.ready) != 0 {
 		t.Errorf("recovered ready length = %d, want 0", len(q2.ready))
 	}
@@ -194,10 +211,7 @@ func TestRecoverEnqueued(t *testing.T) {
 	b, _ := q1.Enqueue([]byte("b"), "key-b")
 	c, _ := q1.Enqueue([]byte("c"), "key-c")
 
-	q2, err := NewQueue(path)
-	if err != nil {
-		t.Fatalf("reopen NewQueue: %v", err)
-	}
+	q2 := reopenQueue(t, path)
 
 	if len(q2.index) != 3 {
 		t.Fatalf("recovered index length = %d, want 3", len(q2.index))
@@ -226,10 +240,7 @@ func TestRecoverAckedTaskGone(t *testing.T) {
 		t.Fatalf("Ack: %v", err)
 	}
 
-	q2, err := NewQueue(path)
-	if err != nil {
-		t.Fatalf("reopen NewQueue: %v", err)
-	}
+	q2 := reopenQueue(t, path)
 
 	if _, ok := q2.index[a]; ok {
 		t.Errorf("acked task %s present in recovered index, want it gone", a)
@@ -262,10 +273,7 @@ func TestRecoverRetryCount(t *testing.T) {
 		}
 	}
 
-	q2, err := NewQueue(path)
-	if err != nil {
-		t.Fatalf("reopen NewQueue: %v", err)
-	}
+	q2 := reopenQueue(t, path)
 
 	task, ok := q2.index[a]
 	if !ok {
@@ -297,10 +305,7 @@ func TestRecoverMixedLog(t *testing.T) {
 		t.Fatalf("Retry c: %v", err)
 	}
 
-	q2, err := NewQueue(path)
-	if err != nil {
-		t.Fatalf("reopen NewQueue: %v", err)
-	}
+	q2 := reopenQueue(t, path)
 
 	// a: dequeue not logged -> replays as ready.
 	if ta, ok := q2.index[a]; !ok {
@@ -324,5 +329,233 @@ func TestRecoverMixedLog(t *testing.T) {
 		if tc.Retries != 1 {
 			t.Errorf("recovered c Retries = %d, want 1", tc.Retries)
 		}
+	}
+}
+
+// --- Phase 4: leasing, sweeper, concurrency ---
+
+// newTestQueueWith creates a queue with explicit lease/sweep durations (for sweeper
+// tests) and registers Close for cleanup. Do NOT use it in tests that call Close
+// themselves (double close panics).
+func newTestQueueWith(t *testing.T, visibility, sweep time.Duration) *Queue {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "q.wal")
+	q, err := NewQueue(path, visibility, sweep)
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	t.Cleanup(func() { q.Close() })
+	return q
+}
+
+// waitFor polls cond every 2ms until it returns true or the timeout elapses.
+// cond must read shared state under q.mu to stay race-free against the sweeper.
+func waitFor(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return cond()
+}
+
+// Dequeue grants a lease: the task leaves ready, enters indexOfInflight, becomes
+// inflight, and gets a LeaseUntil in the future.
+func TestDequeueSetsLease(t *testing.T) {
+	q, _ := newTestQueue(t) // huge timeout: sweeper stays inert
+	id, _ := q.Enqueue([]byte("a"), "key-a")
+
+	before := time.Now()
+	task, ok, err := q.Dequeue()
+	if err != nil || !ok {
+		t.Fatalf("Dequeue: ok=%v err=%v", ok, err)
+	}
+	if task.ID != id {
+		t.Fatalf("Dequeue returned %s, want %s", task.ID, id)
+	}
+	if task.Status != StateInflight {
+		t.Errorf("Status = %s, want inflight", task.Status)
+	}
+	if _, in := q.indexOfInflight[id]; !in {
+		t.Errorf("task not in indexOfInflight after Dequeue")
+	}
+	if len(q.ready) != 0 {
+		t.Errorf("ready length = %d, want 0 after Dequeue", len(q.ready))
+	}
+	if !task.LeaseUntil.After(before) {
+		t.Errorf("LeaseUntil = %v, want after %v", task.LeaseUntil, before)
+	}
+}
+
+// A single Sweeper pass reclaims a task whose lease has expired: back to ready,
+// Retries bumped, and removed from indexOfInflight. Deterministic (manual pass,
+// inert background sweeper).
+func TestSweeperReclaimsExpiredLease(t *testing.T) {
+	q := newTestQueueWith(t, 5*time.Millisecond, time.Hour) // short lease, inert bg sweeper
+	id, _ := q.Enqueue([]byte("a"), "key-a")
+	if _, ok, _ := q.Dequeue(); !ok {
+		t.Fatal("Dequeue returned ok=false")
+	}
+
+	time.Sleep(20 * time.Millisecond) // lease (5ms) is now expired
+
+	if err := q.Sweeper(); err != nil {
+		t.Fatalf("Sweeper: %v", err)
+	}
+
+	if _, in := q.indexOfInflight[id]; in {
+		t.Errorf("task still in indexOfInflight after reclaim, want removed")
+	}
+	if len(q.ready) != 1 {
+		t.Fatalf("ready length = %d, want 1 after reclaim", len(q.ready))
+	}
+	task := q.index[id]
+	if task.Status != StateReady {
+		t.Errorf("Status = %s, want ready", task.Status)
+	}
+	if task.Retries != 1 {
+		t.Errorf("Retries = %d, want 1", task.Retries)
+	}
+}
+
+// A Sweeper pass must NOT touch a task whose lease is still valid.
+func TestSweeperKeepsValidLease(t *testing.T) {
+	q := newTestQueueWith(t, time.Hour, time.Hour) // long lease, inert bg sweeper
+	id, _ := q.Enqueue([]byte("a"), "key-a")
+	if _, ok, _ := q.Dequeue(); !ok {
+		t.Fatal("Dequeue returned ok=false")
+	}
+
+	if err := q.Sweeper(); err != nil {
+		t.Fatalf("Sweeper: %v", err)
+	}
+
+	if _, in := q.indexOfInflight[id]; !in {
+		t.Errorf("valid-lease task removed from indexOfInflight, want kept")
+	}
+	if len(q.ready) != 0 {
+		t.Errorf("ready length = %d, want 0 (task should stay inflight)", len(q.ready))
+	}
+	task := q.index[id]
+	if task.Status != StateInflight {
+		t.Errorf("Status = %s, want inflight", task.Status)
+	}
+	if task.Retries != 0 {
+		t.Errorf("Retries = %d, want 0 (no reclaim)", task.Retries)
+	}
+}
+
+// End-to-end: the background sweeper goroutine (not a manual pass) reclaims an
+// expired lease on its own.
+func TestBackgroundSweeperReclaims(t *testing.T) {
+	q := newTestQueueWith(t, 5*time.Millisecond, 2*time.Millisecond) // short lease, fast tick
+	id, _ := q.Enqueue([]byte("a"), "key-a")
+	if _, ok, _ := q.Dequeue(); !ok {
+		t.Fatal("Dequeue returned ok=false")
+	}
+
+	reclaimed := waitFor(time.Second, func() bool {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		return len(q.ready) == 1
+	})
+	if !reclaimed {
+		t.Fatal("background sweeper did not reclaim the expired lease within 1s")
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, in := q.indexOfInflight[id]; in {
+		t.Errorf("task still in indexOfInflight after background reclaim")
+	}
+	if task := q.index[id]; task.Retries != 1 {
+		t.Errorf("Retries = %d, want 1", task.Retries)
+	}
+}
+
+// Many goroutines hammer Enqueue/Dequeue/Ack at once. The load-bearing check is
+// running this under `go test -race`: without the mutex it panics with
+// "concurrent map writes"; with it, every task is produced and processed exactly
+// once (produced == acked, index drained).
+func TestConcurrentOpsRace(t *testing.T) {
+	q, _ := newTestQueue(t) // huge timeout: sweeper stays inert
+
+	// Task count kept modest: every Enqueue/Ack does a durable fsync, so this is
+	// bounded by disk, not CPU. 16 goroutines still give -race plenty of contention.
+	const producers = 8
+	const perProducer = 25
+	total := int64(producers * perProducer)
+
+	var wg sync.WaitGroup
+
+	for p := 0; p < producers; p++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perProducer; i++ {
+				if _, err := q.Enqueue([]byte("x"), "k"); err != nil {
+					t.Errorf("Enqueue: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	var acked int64
+	const consumers = 8
+	for c := 0; c < consumers; c++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				task, ok, err := q.Dequeue()
+				if err != nil {
+					t.Errorf("Dequeue: %v", err)
+					return
+				}
+				if !ok {
+					return // queue drained
+				}
+				if err := Ack(q, task.ID); err != nil {
+					t.Errorf("Ack: %v", err)
+					return
+				}
+				atomic.AddInt64(&acked, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if acked != total {
+		t.Errorf("acked = %d, want %d (conservation: produced == processed)", acked, total)
+	}
+	if len(q.index) != 0 {
+		t.Errorf("index length = %d, want 0 after draining", len(q.index))
+	}
+}
+
+// Close stops the sweeper cleanly: it returns promptly (doesn't deadlock) even
+// with the sweeper actively ticking. This test owns the Close, so it does NOT use
+// a helper that also registers Close (double close would panic).
+func TestCloseStopsSweeper(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "q.wal")
+	q, err := NewQueue(path, time.Hour, 2*time.Millisecond) // fast tick: sweeper is active
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		q.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done: // Close returned: close(stop) + wg.Wait() completed
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return within 1s (sweeper likely not stopping)")
 	}
 }
