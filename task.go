@@ -1,7 +1,10 @@
 package task_queue
+
 import (
-	"github.com/google/uuid"
+	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type TaskState uint8
@@ -30,18 +33,61 @@ func (s TaskState) String() string {
 
 }
 
-
 // Defining task struct inside here
 type Task struct {
-	ID uuid.UUID  // UUID identifier for the job
+	ID             uuid.UUID // UUID identifier for the job
 	IdempotencyKey string
-	Payload []byte
-	Status TaskState 
-	Retries int
-	Priority int // Consider how we can define this (this is for priority queues since some jobs are more important than others)
-	
+	Payload        []byte
+	Status         TaskState
+	Retries        int
+	AvailableAt    time.Time // When we can dequeue the task again (after retries)
+	FailedAt       time.Time
+	Priority       int // Consider how we can define this (this is for priority queues since some jobs are more important than others)
+
 	// Know when the job was enqueued & leaseUntil acts like visibility timeout from AWS SQS (a lock)
 	EnqueuedAt time.Time
 	LeaseUntil time.Time
-	Owner string  
+	Owner      string
+}
+
+// String renders a Task as a readable multi-line block.
+// Because it has this method, *Task and Task both satisfy fmt.Stringer,
+// so fmt.Println(t) / fmt.Printf("%v", t) call it automatically.
+func (t Task) String() string {
+	owner := t.Owner
+	if owner == "" {
+		owner = "-"
+	}
+	return fmt.Sprintf(
+		"Task %s\n"+
+			"  Status:       %s\n"+
+			"  Retries:      %d\n"+
+			"  Priority:     %d\n"+
+			"  Payload:      %d bytes\n"+
+			"  IdempKey:     %s\n"+
+			"  Owner:        %s\n"+
+			"  EnqueuedAt:   %s\n"+
+			"  AvailableAt:  %s\n"+
+			"  LeaseUntil:   %s\n"+
+			"  FailedAt:     %s",
+		t.ID,
+		t.Status, // reuses TaskState.String()
+		t.Retries,
+		t.Priority,
+		len(t.Payload),
+		t.IdempotencyKey,
+		owner,
+		fmtTime(t.EnqueuedAt),
+		fmtTime(t.AvailableAt),
+		fmtTime(t.LeaseUntil),
+		fmtTime(t.FailedAt),
+	)
+}
+
+// fmtTime prints "-" for the zero time so unset fields don't show as 0001-01-01.
+func fmtTime(ts time.Time) string {
+	if ts.IsZero() {
+		return "-"
+	}
+	return ts.Format(time.RFC3339)
 }

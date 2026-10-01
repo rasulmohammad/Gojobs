@@ -258,14 +258,19 @@ func TestRetryPayloadRoundTrip(t *testing.T) {
 
 // Dead round trip: same shape as Ack.
 func TestDeadPayloadRoundTrip(t *testing.T) {
-	want := DeadPayload{ID: uuid.New()}
+	want := DeadPayload{
+		ID:       uuid.New(),
+		Retries:  4,
+		FailedAt: time.Date(2026, 9, 24, 12, 0, 0, 7, time.UTC),
+	}
 
 	b, err := encodeDeadPayload(want)
 	if err != nil {
 		t.Fatalf("encodeDeadPayload returned error: %v", err)
 	}
-	if len(b) != 16 {
-		t.Errorf("encoded length = %d, want 16", len(b))
+	// 16 (ID) + 4 (Retries) + 8 (FailedAt nanos) = 28.
+	if len(b) != 28 {
+		t.Errorf("encoded length = %d, want 28", len(b))
 	}
 
 	got, err := decodeDeadPayload(b)
@@ -274,6 +279,12 @@ func TestDeadPayloadRoundTrip(t *testing.T) {
 	}
 	if got.ID != want.ID {
 		t.Errorf("ID = %s, want %s", got.ID, want.ID)
+	}
+	if got.Retries != want.Retries {
+		t.Errorf("Retries = %d, want %d", got.Retries, want.Retries)
+	}
+	if !got.FailedAt.Equal(want.FailedAt) {
+		t.Errorf("FailedAt = %v, want %v", got.FailedAt, want.FailedAt)
 	}
 }
 
@@ -405,7 +416,12 @@ func TestRecordRoundTripAllOps(t *testing.T) {
 
 	// Dead
 	{
-		fields, err := encodeDeadPayload(DeadPayload{ID: id})
+		want := DeadPayload{
+			ID:       id,
+			Retries:  5,
+			FailedAt: time.Date(2026, 9, 24, 12, 10, 0, 11, time.UTC),
+		}
+		fields, err := encodeDeadPayload(want)
 		if err != nil {
 			t.Fatalf("encodeDeadPayload: %v", err)
 		}
@@ -420,8 +436,52 @@ func TestRecordRoundTripAllOps(t *testing.T) {
 		if !ok {
 			t.Fatalf("payload type = %T, want DeadPayload", payload)
 		}
+		if got.ID != want.ID || got.Retries != want.Retries || !got.FailedAt.Equal(want.FailedAt) {
+			t.Errorf("dead payload = %+v, want %+v", got, want)
+		}
+	}
+
+	// Requeue
+	{
+		fields, err := encodeRequeuePayload(RequeuePayload{ID: id})
+		if err != nil {
+			t.Fatalf("encodeRequeuePayload: %v", err)
+		}
+		op, payload, err := decodeRecord(encodeRecord(OperationRequeue, fields))
+		if err != nil {
+			t.Fatalf("decodeRecord(requeue): %v", err)
+		}
+		if op != OperationRequeue {
+			t.Errorf("op = %s, want requeue", op)
+		}
+		got, ok := payload.(RequeuePayload)
+		if !ok {
+			t.Fatalf("payload type = %T, want RequeuePayload", payload)
+		}
 		if got.ID != id {
-			t.Errorf("dead ID = %s, want %s", got.ID, id)
+			t.Errorf("requeue ID = %s, want %s", got.ID, id)
+		}
+	}
+
+	// Purge
+	{
+		fields, err := encodePurgePayload(PurgePayload{ID: id})
+		if err != nil {
+			t.Fatalf("encodePurgePayload: %v", err)
+		}
+		op, payload, err := decodeRecord(encodeRecord(OperationPurge, fields))
+		if err != nil {
+			t.Fatalf("decodeRecord(purge): %v", err)
+		}
+		if op != OperationPurge {
+			t.Errorf("op = %s, want purge", op)
+		}
+		got, ok := payload.(PurgePayload)
+		if !ok {
+			t.Fatalf("payload type = %T, want PurgePayload", payload)
+		}
+		if got.ID != id {
+			t.Errorf("purge ID = %s, want %s", got.ID, id)
 		}
 	}
 }

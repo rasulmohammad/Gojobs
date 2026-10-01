@@ -2,10 +2,19 @@ package task_queue
 
 import (
 	"fmt"
+	"math"
+	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+)
+
+const (
+	// Backoff constraints
+	baseDelay = 1 * time.Second
+	maxDelay  = 30 * time.Second
 )
 
 // ready is our FIFO queue to deliver the next task via Dequeue()
@@ -18,10 +27,12 @@ type Queue struct {
 	indexOfInflight   map[uuid.UUID]*Task
 	wal               *WAL
 	mu                sync.Mutex
-	stop              chan struct{}  // Close() closes this to tell the sweeper to exit
-	wg                sync.WaitGroup // waits for the sweeper goroutine to actually finish
-	visibilityTimeout time.Duration  // how long a worker can hog a task for
-	sweepInterval     time.Duration  // how often the sweeper wakes to check for expired leases
+	stop              chan struct{}       // Close() closes this to tell the sweeper to exit
+	wg                sync.WaitGroup      // waits for the sweeper goroutine to actually finish
+	visibilityTimeout time.Duration       // how long a worker can hog a task for
+	sweepInterval     time.Duration       // how often the sweeper wakes to check for expired leases
+	maxRetries        int                 // Total amount of retries we allow a task before we move into DLQ
+	dlq               map[uuid.UUID]*Task // Contains all tasks that need manual inspection
 }
 
 // NewQueue opens (or creates) the WAL at walPath and returns a Queue backed by
@@ -30,7 +41,7 @@ type Queue struct {
 // visibilityTimeout is how long a dequeued task's lease lasts; sweepInterval is
 // how often the background sweeper checks for expired leases. Tick more often
 // than the timeout so an expired lease isn't left sitting for long.
-func NewQueue(walPath string, visibilityTimeout, sweepInterval time.Duration) (*Queue, error) {
+func NewQueue(walPath string, visibilityTimeout, sweepInterval time.Duration, maxRetries int) (*Queue, error) {
 	w, err := OpenWAL(walPath)
 	if err != nil {
 		return nil, err
@@ -43,6 +54,8 @@ func NewQueue(walPath string, visibilityTimeout, sweepInterval time.Duration) (*
 		stop:              make(chan struct{}),
 		visibilityTimeout: visibilityTimeout,
 		sweepInterval:     sweepInterval,
+		maxRetries:        maxRetries,
+		dlq:               make(map[uuid.UUID]*Task),
 	}
 
 	// Read each record from the loop with Replay().
@@ -105,10 +118,42 @@ func (q *Queue) applyRecord(record []byte) error {
 		p := payload.(RetryPayload)
 		t := q.index[p.ID]
 		t.Retries += 1
-		q.index[p.ID].Status = StateReady
+		t.Status = StateReady
+		delete(q.indexOfInflight, t.ID)
+		// Intentionally allowing a retried task to be available immediately -- no harm in letting it be retried 1x. Only during WAL replay cases
+		t.AvailableAt = time.Now()
 	case OperationDead:
 		p := payload.(DeadPayload)
-		q.index[p.ID].Status = StateDead
+		t := q.index[p.ID]
+		for i, t2 := range q.ready {
+			if t.ID == t2.ID {
+				// Removing dead task from ready queue (because we dont log dequeue)
+				q.ready = append(q.ready[:i], q.ready[i+1:]...)
+				break
+			}
+		}
+		t.Status = StateDead
+		// Absolute count from the record, not a delta, so it's robust to changes
+		// in retry accounting.
+		t.Retries = p.Retries
+		t.FailedAt = p.FailedAt
+		q.dlq[t.ID] = t
+		delete(q.indexOfInflight, t.ID)
+		delete(q.index, t.ID)
+	case OperationRequeue:
+		p := payload.(RequeuePayload)
+		// A dead task lives in dlq (not index) at replay time; move it back.
+		t := q.dlq[p.ID]
+		t.Status = StateReady
+		t.Retries = 0
+		t.AvailableAt = time.Time{}
+		t.FailedAt = time.Time{}
+		delete(q.dlq, p.ID)
+		q.index[p.ID] = t
+		q.ready = append(q.ready, t)
+	case OperationPurge:
+		p := payload.(PurgePayload)
+		delete(q.dlq, p.ID)
 	default:
 		return err
 	}
@@ -205,16 +250,20 @@ func (q *Queue) Dequeue() (*Task, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	// Ensuring non-empty array
-	if len(q.ready) > 0 {
-		t := q.ready[0]
-		q.ready = q.ready[1:]
+	now := time.Now()
+	for i, t := range q.ready {
+		// Only process tasks that are ready
+		if t.AvailableAt.After(now) {
+			continue
+		}
+
+		// We have a ready task
+		q.ready = append(q.ready[:i], q.ready[i+1:]...)
 
 		// Updating task itself since map holds a pointer to it
 		t.Status = StateInflight
+		t.LeaseUntil = now.Add(q.visibilityTimeout)
 		q.indexOfInflight[t.ID] = t
-
-		t.LeaseUntil = time.Now().Add(q.visibilityTimeout)
-
 		return t, true, nil
 	}
 
@@ -267,20 +316,159 @@ func retryLocked(q *Queue, id uuid.UUID) error {
 		return fmt.Errorf("task %s not found", id)
 	}
 
-	fields, err := encodeRetryPayload(RetryPayload{ID: id})
-	if err != nil {
-		return err
-	}
+	taskWillDieAfterRetry := t.Retries+1 > q.maxRetries
 
-	_, err = q.wal.Append(encodeRecord(OperationRetry, fields))
-	if err != nil {
-		return err
-	}
+	if taskWillDieAfterRetry { // WAL should have a Dead() payload written to it so it knows --> DLQ
+		// Move into DLQ & remove from retry and return. First make durable though
+		// t.Retries is still pre-increment here; the tail below bumps it to this
+		// same value, so store t.Retries+1 as the final count.
+		// Capture one timestamp so the persisted record and the in-memory task agree.
+		failedAt := time.Now()
+		fields, err := encodeDeadPayload(DeadPayload{ID: id, Retries: t.Retries + 1, FailedAt: failedAt})
+		if err != nil {
+			return err
+		}
 
-	t.Status = StateReady
+		_, err = q.wal.Append(encodeRecord(OperationDead, fields))
+		if err != nil {
+			return err
+		}
+
+		t.Status = StateDead
+		t.FailedAt = failedAt
+		q.dlq[id] = t
+		delete(q.index, id)
+
+	} else { // WAL should have Retry() payload written to it so it knows --> task back in Ready[]
+		fields, err := encodeRetryPayload(RetryPayload{ID: id})
+		if err != nil {
+			return err
+		}
+
+		_, err = q.wal.Append(encodeRecord(OperationRetry, fields))
+		if err != nil {
+			return err
+		}
+
+		t.Status = StateReady
+		t.AvailableAt = time.Now().Add(generateBackoff(t.Retries))
+		q.ready = append(q.ready, t)
+
+	}
 	t.Retries += 1
-
-	q.ready = append(q.ready, t)
 	delete(q.indexOfInflight, id)
+	return nil
+}
+
+func generateBackoff(retryAttempt int) time.Duration {
+	// exponential ceiling in nanoseconds: base * 2^attempt
+	exp := float64(baseDelay) * math.Pow(2, float64(retryAttempt))
+	if exp > float64(maxDelay) { // cap (also catches +Inf for huge attempts)
+		exp = float64(maxDelay)
+	}
+	// full jitter: uniform in [0, exp)
+	return time.Duration(rand.Float64() * exp)
+}
+
+/*
+	Accessor functions for our DLQ split by Accessor functions and then mutating functions
+	Accessor functions:
+*/
+
+// ListDeadTasks returns copies of every task in the DLQ, most recent failure
+// first. Copies (not the stored *Task) so callers can't mutate live state
+// outside the lock. Cannot fail, so no error return.
+func (q *Queue) ListDeadTasks() []Task {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	// Copy the structs out while holding the lock, then sort the copies.
+	deadTasks := make([]Task, 0, len(q.dlq))
+	for _, t := range q.dlq {
+		deadTasks = append(deadTasks, *t)
+	}
+
+	// Most recent failure first.
+	sort.Slice(deadTasks, func(i, j int) bool {
+		return deadTasks[i].FailedAt.After(deadTasks[j].FailedAt)
+	})
+
+	return deadTasks
+}
+
+// DeadTask returns a copy of one dead task, or an error if it isn't in the DLQ.
+func (q *Queue) DeadTask(id uuid.UUID) (Task, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	t, ok := q.dlq[id]
+	if !ok {
+		return Task{}, fmt.Errorf("task %s not found in DLQ", id)
+	}
+	return *t, nil
+}
+
+// DLQLen returns the number of tasks currently in the DLQ.
+func (q *Queue) DLQLen() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.dlq)
+}
+
+/*
+Mutating functions
+*/
+
+// RequeueDead revives a dead task back onto the ready queue, preserving its
+// identity (same ID/payload) but resetting its retry history so it gets a fresh
+// set of attempts. WAL-first: the REQUEUE record is durable before any in-memory
+// change, so recovery replays the revival.
+func (q *Queue) RequeueDead(id uuid.UUID) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	t, ok := q.dlq[id]
+	if !ok {
+		return fmt.Errorf("task %s not found in DLQ", id)
+	}
+
+	fields, err := encodeRequeuePayload(RequeuePayload{ID: id})
+	if err != nil {
+		return err
+	}
+	if _, err := q.wal.Append(encodeRecord(OperationRequeue, fields)); err != nil {
+		return err
+	}
+
+	// Durable now: fresh start on ready.
+	t.Status = StateReady
+	t.Retries = 0
+	t.AvailableAt = time.Time{}
+	t.FailedAt = time.Time{}
+	delete(q.dlq, id)
+	q.index[id] = t
+	q.ready = append(q.ready, t)
+	return nil
+}
+
+// PurgeDeadTask permanently removes a dead task from the DLQ so the map doesn't
+// grow unbounded. WAL-first so the removal survives recovery.
+func (q *Queue) PurgeDeadTask(id uuid.UUID) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if _, ok := q.dlq[id]; !ok {
+		return fmt.Errorf("task %s not found in DLQ", id)
+	}
+
+	fields, err := encodePurgePayload(PurgePayload{ID: id})
+	if err != nil {
+		return err
+	}
+	if _, err := q.wal.Append(encodeRecord(OperationPurge, fields)); err != nil {
+		return err
+	}
+
+	delete(q.dlq, id)
 	return nil
 }
