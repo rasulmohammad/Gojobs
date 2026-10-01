@@ -27,7 +27,7 @@ import (
 func newTestQueue(t *testing.T) (*Queue, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "q.wal")
-	q, err := NewQueue(path, time.Hour, time.Hour)
+	q, err := NewQueue(path, time.Hour, time.Hour, 1000)
 	if err != nil {
 		t.Fatalf("NewQueue: %v", err)
 	}
@@ -40,7 +40,7 @@ func newTestQueue(t *testing.T) (*Queue, string) {
 // registers Close for cleanup.
 func reopenQueue(t *testing.T, path string) *Queue {
 	t.Helper()
-	q, err := NewQueue(path, time.Hour, time.Hour)
+	q, err := NewQueue(path, time.Hour, time.Hour, 1000)
 	if err != nil {
 		t.Fatalf("reopen NewQueue: %v", err)
 	}
@@ -152,10 +152,24 @@ func TestRetry(t *testing.T) {
 		t.Errorf("after Retry, Retries = %d, want 1", task.Retries)
 	}
 
-	// The retried task should be available to dequeue again.
+	// Backoff: a just-retried task is NOT immediately dequeueable; it waits out
+	// its AvailableAt window first.
+	if !task.AvailableAt.After(time.Now()) {
+		t.Errorf("after Retry, AvailableAt = %v, want a future (backoff) time", task.AvailableAt)
+	}
+	if _, ok, _ := q.Dequeue(); ok {
+		t.Fatal("retried task was immediately dequeueable, want it to be backing off")
+	}
+
+	// Once the backoff window has passed it becomes dequeueable again. Clear it
+	// directly instead of sleeping out the (up to baseDelay) jittered delay.
+	q.mu.Lock()
+	q.index[id].AvailableAt = time.Time{}
+	q.mu.Unlock()
+
 	again, ok, _ := q.Dequeue()
 	if !ok {
-		t.Fatal("expected the retried task to be dequeueable again")
+		t.Fatal("expected the retried task to be dequeueable after its backoff window")
 	}
 	if again.ID != id {
 		t.Errorf("re-Dequeue returned %s, want the retried task %s", again.ID, id)
@@ -340,7 +354,7 @@ func TestRecoverMixedLog(t *testing.T) {
 func newTestQueueWith(t *testing.T, visibility, sweep time.Duration) *Queue {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "q.wal")
-	q, err := NewQueue(path, visibility, sweep)
+	q, err := NewQueue(path, visibility, sweep, 1000)
 	if err != nil {
 		t.Fatalf("NewQueue: %v", err)
 	}
@@ -542,7 +556,7 @@ func TestConcurrentOpsRace(t *testing.T) {
 // a helper that also registers Close (double close would panic).
 func TestCloseStopsSweeper(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "q.wal")
-	q, err := NewQueue(path, time.Hour, 2*time.Millisecond) // fast tick: sweeper is active
+	q, err := NewQueue(path, time.Hour, 2*time.Millisecond, 1000) // fast tick: sweeper is active
 	if err != nil {
 		t.Fatalf("NewQueue: %v", err)
 	}

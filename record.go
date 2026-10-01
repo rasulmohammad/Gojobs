@@ -22,6 +22,8 @@ const (
 	OperationAck
 	OperationRetry
 	OperationDead
+	OperationRequeue
+	OperationPurge
 )
 
 func (o OperationType) String() string {
@@ -36,6 +38,10 @@ func (o OperationType) String() string {
 		return "retry"
 	case OperationDead:
 		return "dead"
+	case OperationRequeue:
+		return "requeue"
+	case OperationPurge:
+		return "purge"
 	default:
 		return "unknown"
 	}
@@ -228,13 +234,23 @@ func decodeRetryPayload(b []byte) (RetryPayload, error) {
 }
 
 type DeadPayload struct {
-	ID uuid.UUID
+	ID       uuid.UUID
+	Retries  int
+	FailedAt time.Time
 }
 
 func encodeDeadPayload(p DeadPayload) ([]byte, error) {
 	var buf bytes.Buffer
+	var scratch [8]byte
 	//ID
 	buf.Write(p.ID[:])
+	// Retries: fixed 4 bytes, matches how Priority is encoded above. Absolute
+	// count so a replayed DLQ entry is self-describing.
+	binary.BigEndian.PutUint32(scratch[:4], uint32(p.Retries))
+	buf.Write(scratch[:4])
+	// FailedAt: 8-byte unix nanos, same encoding as EnqueuedAt.
+	binary.BigEndian.PutUint64(scratch[:8], uint64(p.FailedAt.UnixNano()))
+	buf.Write(scratch[:8])
 	return buf.Bytes(), nil
 }
 
@@ -243,10 +259,52 @@ func decodeDeadPayload(b []byte) (DeadPayload, error) {
 	if err != nil {
 		return DeadPayload{}, err
 	}
+	Retries := int(binary.BigEndian.Uint32(b[16:20]))
+	FailedAt := time.Unix(0, int64(binary.BigEndian.Uint64(b[20:28]))).UTC()
 
 	return DeadPayload{
-		ID: ID,
+		ID:       ID,
+		Retries:  Retries,
+		FailedAt: FailedAt,
 	}, nil
+}
+
+// RequeuePayload and PurgePayload are ID-only, same shape as RetryPayload: the
+// task's full state already lives in the DLQ, so the record just names which one.
+type RequeuePayload struct {
+	ID uuid.UUID
+}
+
+func encodeRequeuePayload(p RequeuePayload) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Write(p.ID[:])
+	return buf.Bytes(), nil
+}
+
+func decodeRequeuePayload(b []byte) (RequeuePayload, error) {
+	ID, err := uuid.FromBytes(b[:16])
+	if err != nil {
+		return RequeuePayload{}, err
+	}
+	return RequeuePayload{ID: ID}, nil
+}
+
+type PurgePayload struct {
+	ID uuid.UUID
+}
+
+func encodePurgePayload(p PurgePayload) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Write(p.ID[:])
+	return buf.Bytes(), nil
+}
+
+func decodePurgePayload(b []byte) (PurgePayload, error) {
+	ID, err := uuid.FromBytes(b[:16])
+	if err != nil {
+		return PurgePayload{}, err
+	}
+	return PurgePayload{ID: ID}, nil
 }
 
 // --- record layer: op tag + dispatch ---
@@ -286,6 +344,12 @@ func decodeRecord(body []byte) (OperationType, interface{}, error) {
 		return op, p, err
 	case OperationDead:
 		p, err := decodeDeadPayload(fields)
+		return op, p, err
+	case OperationRequeue:
+		p, err := decodeRequeuePayload(fields)
+		return op, p, err
+	case OperationPurge:
+		p, err := decodePurgePayload(fields)
 		return op, p, err
 	default:
 		return op, nil, fmt.Errorf("decodeRecord: unknown op %d", op)
