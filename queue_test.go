@@ -10,6 +10,7 @@ Tests to cover:
 */
 
 import (
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -509,7 +510,10 @@ func TestConcurrentOpsRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perProducer; i++ {
-				if _, err := q.Enqueue([]byte("x"), "k"); err != nil {
+				// Unique key per enqueue: with 6.2 dedup, a shared key would
+				// collapse all producers to one task. Distinct keys produce
+				// `total` real tasks AND exercise the byIdemKey map under -race.
+				if _, err := q.Enqueue([]byte("x"), fmt.Sprintf("k-%d-%d", p, i)); err != nil {
 					t.Errorf("Enqueue: %v", err)
 					return
 				}

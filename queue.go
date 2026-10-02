@@ -25,6 +25,7 @@ type Queue struct {
 	ready             []*Task
 	index             map[uuid.UUID]*Task
 	indexOfInflight   map[uuid.UUID]*Task
+	indexOfIdemKeys   map[string]*uuid.UUID // Deduplicating task entries into queue
 	wal               *WAL
 	mu                sync.Mutex
 	stop              chan struct{}       // Close() closes this to tell the sweeper to exit
@@ -49,7 +50,8 @@ func NewQueue(walPath string, visibilityTimeout, sweepInterval time.Duration, ma
 
 	q := &Queue{
 		index:             make(map[uuid.UUID]*Task),
-		indexOfInflight:   map[uuid.UUID]*Task{},
+		indexOfInflight:   make(map[uuid.UUID]*Task),
+		indexOfIdemKeys:   make(map[string]*uuid.UUID),
 		wal:               w,
 		stop:              make(chan struct{}),
 		visibilityTimeout: visibilityTimeout,
@@ -95,8 +97,13 @@ func (q *Queue) applyRecord(record []byte) error {
 			EnqueuedAt:     p.EnqueuedAt,
 			Priority:       p.Priority,
 		}
+		_, ok := q.indexOfIdemKeys[t.IdempotencyKey]
+		if t.IdempotencyKey != "" && ok {
+			break
+		}
 		q.ready = append(q.ready, t)
 		q.index[t.ID] = t
+		q.indexOfIdemKeys[t.IdempotencyKey] = &t.ID
 	case OperationDequeue:
 		p := payload.(DequeuePayload)
 		q.index[p.ID].Status = StateInflight
@@ -211,12 +218,19 @@ func (q *Queue) Close() {
 func (q *Queue) Enqueue(payload []byte, idemKey string) (uuid.UUID, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
 	t := &Task{
 		ID:             uuid.New(),
 		IdempotencyKey: idemKey,
 		Payload:        payload,
 		Status:         StateReady,
 		EnqueuedAt:     time.Now(),
+	}
+
+	// Deduplicate task enqueue
+	_, ok := q.indexOfIdemKeys[idemKey]
+	if idemKey != "" && ok {
+		return *q.indexOfIdemKeys[idemKey], nil
 	}
 
 	// Write-ahead: durably record the enqueue before it exists in memory.
@@ -241,6 +255,7 @@ func (q *Queue) Enqueue(payload []byte, idemKey string) (uuid.UUID, error) {
 	// visible in memory; if we crashed right here, replay would rebuild it.
 	q.ready = append(q.ready, t)
 	q.index[t.ID] = t
+	q.indexOfIdemKeys[idemKey] = &t.ID
 
 	return t.ID, nil
 }
