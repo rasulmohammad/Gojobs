@@ -132,13 +132,7 @@ piped/non-interactive stdin falls back to defaults.
 | ack     | ~97  | ~36 ms | ~61 ms |
 | dequeue | ~122 | ~33 ms | ~58 ms |
 
-Numbers are machine-specific. Throughput is bounded by `fsync`: every durable op holds
-the single queue lock across one `fsync` (~3 ms here), so the combined enqueue+ack+retry
-rate tops out near `1 / fsync` no matter how many goroutines you add. Latency is
-correspondingly dominated by *waiting for that lock* — note that `dequeue`, which does no
-`fsync`, still shows ~33 ms because it queues behind in-flight durable writes. These are
-the pre-optimization numbers to beat with group-commit (batch many appends per `fsync`)
-or a min-heap `Dequeue` (replace the O(n) ready scan).
+Numbers are machine-specific.
 
 ### Comparing runs
 
