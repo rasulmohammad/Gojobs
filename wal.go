@@ -15,10 +15,19 @@ import (
 // so Replay treats it as "the log ends here" rather than a fatal error.
 var errCorruptRecord = errors.New("decodeFrame: crc mismatch (corrupt record)")
 
+// syncWriter is the subset of *os.File the WAL actually needs: append bytes and
+// fsync them. Production passes a real *os.File; a test can swap in a fake that
+// fails after N bytes to simulate a crash mid-append.
+type syncWriter interface {
+	io.Writer
+	Sync() error
+}
+
 // This is the log manager. Owns file handle / how to append bytes. It is not an entry in the log
 type WAL struct {
-	file   *os.File // open queue.wal
-	offset int64    // points to the end of the file
+	w      syncWriter // where frames are written (a *os.File in production)
+	path   string     // file path, so Replay can reopen a fresh read handle
+	offset int64      // points to the end of the file
 }
 
 // Open the WAL file so we can write in it
@@ -37,7 +46,7 @@ func OpenWAL(path string) (*WAL, error) {
 		return nil, err
 	}
 
-	return &WAL{file: f, offset: info.Size()}, nil
+	return &WAL{w: f, path: path, offset: info.Size()}, nil
 }
 
 // Takes in the encoded record and writes it into our WAL
@@ -51,8 +60,8 @@ func (w *WAL) Append(record []byte) (offset int64, err error) {
 
 	start := w.offset
 
-	// 2. w.file.Write() to the file with the frame
-	n, err := w.file.Write(frame)
+	// 2. w.w.Write() to the file with the frame
+	n, err := w.w.Write(frame)
 	if err != nil {
 		return 0, err
 	}
@@ -60,7 +69,7 @@ func (w *WAL) Append(record []byte) (offset int64, err error) {
 	// Currently fsync per record. Lowest throughput though
 	// consider accumulating several appends and fsync'ing a batch.
 	// adds some latency due to postponing ack to consumer until the batch submission
-	err = w.file.Sync() // actually writes to disk. Write() writes to OS cache
+	err = w.w.Sync() // actually writes to disk. Write() writes to OS cache
 	if err != nil {
 		return 0, err
 	}
@@ -76,7 +85,7 @@ func (w *WAL) Append(record []byte) (offset int64, err error) {
 // re-enqueue, ack it, etc. Decodes each record and hands it to the apply function to handle
 func (w *WAL) Replay(apply func(record []byte) error) error {
 	//Create the reader
-	f, err := os.Open(w.file.Name())
+	f, err := os.Open(w.path)
 	if err != nil {
 		return err
 	}

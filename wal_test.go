@@ -138,7 +138,7 @@ func TestOpenWALNewFileOffsetZero(t *testing.T) {
 	if w.offset != 0 {
 		t.Errorf("new WAL offset = %d, want 0", w.offset)
 	}
-	if _, err := w.file.Stat(); err != nil {
+	if _, err := os.Stat(w.path); err != nil {
 		t.Errorf("expected file to exist after OpenWAL, stat error: %v", err)
 	}
 }
