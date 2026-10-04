@@ -1,4 +1,4 @@
-package task_queue
+package queue
 
 //   1. effectStore — a toy *idempotent* endpoint. Applying the same idemKey
 //      more than once still counts once. This is what makes the queue's

@@ -1,4 +1,4 @@
-package task_queue
+package queue
 
 import (
 	"testing"

@@ -1,4 +1,4 @@
-package task_queue
+package queue
 
 // Verifying correct behavior across producers -> WAL -> Recovery -> Consumers -> Effects
 
