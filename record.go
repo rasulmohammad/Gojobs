@@ -9,10 +9,16 @@ import (
 	"github.com/google/uuid"
 )
 
-// TODO: decoders currently assume well-formed input. A truncated buffer or a
-// length prefix larger than the remaining bytes will panic (slice out of range)
-// instead of returning an error. Add bounds checking / error returns next, then
-// add truncation tests to record_test.go.
+// readN returns the next n bytes starting at pos, plus the advanced position, or
+// an error if the body is too short. Decoders read through it instead of slicing
+// b directly, so a truncated or malformed body returns an error rather than
+// panicking with a slice-out-of-range.
+func readN(b []byte, pos, n int) ([]byte, int, error) {
+	if n < 0 || pos+n > len(b) {
+		return nil, pos, fmt.Errorf("decode: need %d bytes at offset %d, have %d", n, pos, len(b))
+	}
+	return b[pos : pos+n], pos + n, nil
+}
 
 type OperationType uint8
 
@@ -96,41 +102,55 @@ func encodeEnqueuePayload(p EnqueuePayload) ([]byte, error) {
 }
 
 func decodeEnqueuePayload(b []byte) (EnqueuePayload, error) {
-	// A running offset for clearer naming convention
-	bytePos := 0
 	//First 16 bytes is ID:
-	ID, err := uuid.FromBytes(b[:16])
+	idBytes, pos, err := readN(b, 0, 16)
 	if err != nil {
 		return EnqueuePayload{}, err
 	}
-	bytePos += 16
+	ID, err := uuid.FromBytes(idBytes)
+	if err != nil {
+		return EnqueuePayload{}, err
+	}
 
-	//Idempotency key
-	IdempotencyKeyLength := int(binary.BigEndian.Uint32(b[bytePos : bytePos+4]))
-	bytePos += 4
-	IdempotencyKey := string(b[bytePos : bytePos+IdempotencyKeyLength])
-	bytePos += IdempotencyKeyLength
+	//Idempotency key (4-byte length prefix, then that many bytes)
+	keyLenBytes, pos, err := readN(b, pos, 4)
+	if err != nil {
+		return EnqueuePayload{}, err
+	}
+	keyBytes, pos, err := readN(b, pos, int(binary.BigEndian.Uint32(keyLenBytes)))
+	if err != nil {
+		return EnqueuePayload{}, err
+	}
 
-	//Payload
-	PayloadLength := int(binary.BigEndian.Uint32(b[bytePos : bytePos+4]))
-	bytePos += 4
-	Payload := b[bytePos : bytePos+PayloadLength]
-	bytePos += PayloadLength
+	//Payload (same length-prefixed shape)
+	payloadLenBytes, pos, err := readN(b, pos, 4)
+	if err != nil {
+		return EnqueuePayload{}, err
+	}
+	Payload, pos, err := readN(b, pos, int(binary.BigEndian.Uint32(payloadLenBytes)))
+	if err != nil {
+		return EnqueuePayload{}, err
+	}
 
 	// Enqueued at
-	EnqueuedAtNanoseconds := int64(binary.BigEndian.Uint64(b[bytePos : bytePos+8]))
-	bytePos += 8
-	EnqueuedAt := time.Unix(0, EnqueuedAtNanoseconds).UTC()
+	enqBytes, pos, err := readN(b, pos, 8)
+	if err != nil {
+		return EnqueuePayload{}, err
+	}
+	EnqueuedAt := time.Unix(0, int64(binary.BigEndian.Uint64(enqBytes))).UTC()
 
 	//Priority
-	Priority := int(binary.BigEndian.Uint32(b[bytePos : bytePos+4]))
+	prioBytes, _, err := readN(b, pos, 4)
+	if err != nil {
+		return EnqueuePayload{}, err
+	}
 
 	return EnqueuePayload{
 		ID:             ID,
-		IdempotencyKey: IdempotencyKey,
+		IdempotencyKey: string(keyBytes),
 		Payload:        Payload,
 		EnqueuedAt:     EnqueuedAt,
-		Priority:       Priority,
+		Priority:       int(binary.BigEndian.Uint32(prioBytes)),
 	}, nil
 }
 
@@ -162,31 +182,38 @@ func encodeDequeuePayload(p DequeuePayload) ([]byte, error) {
 }
 
 func decodeDequeuePayload(b []byte) (DequeuePayload, error) {
-	bytePos := 0
-
 	// ID
-	ID, err := uuid.FromBytes(b[:16])
+	idBytes, pos, err := readN(b, 0, 16)
 	if err != nil {
 		return DequeuePayload{}, err
 	}
-	bytePos += 16
+	ID, err := uuid.FromBytes(idBytes)
+	if err != nil {
+		return DequeuePayload{}, err
+	}
 
 	//Time
-	LeaseUntilNanoseconds := int64(binary.BigEndian.Uint64(b[bytePos : bytePos+8]))
-	bytePos += 8
-	LeaseUntil := time.Unix(0, LeaseUntilNanoseconds).UTC()
+	leaseBytes, pos, err := readN(b, pos, 8)
+	if err != nil {
+		return DequeuePayload{}, err
+	}
+	LeaseUntil := time.Unix(0, int64(binary.BigEndian.Uint64(leaseBytes))).UTC()
 
-	//Owner
-	OwnerLength := int(binary.BigEndian.Uint32(b[bytePos : bytePos+4]))
-	bytePos += 4
-	Owner := string(b[bytePos : bytePos+OwnerLength])
+	//Owner (4-byte length prefix, then that many bytes)
+	ownerLenBytes, pos, err := readN(b, pos, 4)
+	if err != nil {
+		return DequeuePayload{}, err
+	}
+	ownerBytes, _, err := readN(b, pos, int(binary.BigEndian.Uint32(ownerLenBytes)))
+	if err != nil {
+		return DequeuePayload{}, err
+	}
 
 	return DequeuePayload{
 		ID:         ID,
 		LeaseUntil: LeaseUntil,
-		Owner:      Owner,
+		Owner:      string(ownerBytes),
 	}, nil
-
 }
 
 type AckPayload struct {
@@ -201,14 +228,15 @@ func encodeAckPayload(p AckPayload) ([]byte, error) {
 }
 
 func decodeAckPayload(b []byte) (AckPayload, error) {
-	ID, err := uuid.FromBytes(b[:16])
+	idBytes, _, err := readN(b, 0, 16)
 	if err != nil {
 		return AckPayload{}, err
 	}
-
-	return AckPayload{
-		ID: ID,
-	}, nil
+	ID, err := uuid.FromBytes(idBytes)
+	if err != nil {
+		return AckPayload{}, err
+	}
+	return AckPayload{ID: ID}, nil
 }
 
 type RetryPayload struct {
@@ -223,14 +251,15 @@ func encodeRetryPayload(p RetryPayload) ([]byte, error) {
 }
 
 func decodeRetryPayload(b []byte) (RetryPayload, error) {
-	ID, err := uuid.FromBytes(b[:16])
+	idBytes, _, err := readN(b, 0, 16)
 	if err != nil {
 		return RetryPayload{}, err
 	}
-
-	return RetryPayload{
-		ID: ID,
-	}, nil
+	ID, err := uuid.FromBytes(idBytes)
+	if err != nil {
+		return RetryPayload{}, err
+	}
+	return RetryPayload{ID: ID}, nil
 }
 
 type DeadPayload struct {
@@ -255,17 +284,27 @@ func encodeDeadPayload(p DeadPayload) ([]byte, error) {
 }
 
 func decodeDeadPayload(b []byte) (DeadPayload, error) {
-	ID, err := uuid.FromBytes(b[:16])
+	idBytes, pos, err := readN(b, 0, 16)
 	if err != nil {
 		return DeadPayload{}, err
 	}
-	Retries := int(binary.BigEndian.Uint32(b[16:20]))
-	FailedAt := time.Unix(0, int64(binary.BigEndian.Uint64(b[20:28]))).UTC()
+	ID, err := uuid.FromBytes(idBytes)
+	if err != nil {
+		return DeadPayload{}, err
+	}
+	retBytes, pos, err := readN(b, pos, 4)
+	if err != nil {
+		return DeadPayload{}, err
+	}
+	failBytes, _, err := readN(b, pos, 8)
+	if err != nil {
+		return DeadPayload{}, err
+	}
 
 	return DeadPayload{
 		ID:       ID,
-		Retries:  Retries,
-		FailedAt: FailedAt,
+		Retries:  int(binary.BigEndian.Uint32(retBytes)),
+		FailedAt: time.Unix(0, int64(binary.BigEndian.Uint64(failBytes))).UTC(),
 	}, nil
 }
 
@@ -282,7 +321,11 @@ func encodeRequeuePayload(p RequeuePayload) ([]byte, error) {
 }
 
 func decodeRequeuePayload(b []byte) (RequeuePayload, error) {
-	ID, err := uuid.FromBytes(b[:16])
+	idBytes, _, err := readN(b, 0, 16)
+	if err != nil {
+		return RequeuePayload{}, err
+	}
+	ID, err := uuid.FromBytes(idBytes)
 	if err != nil {
 		return RequeuePayload{}, err
 	}
@@ -300,7 +343,11 @@ func encodePurgePayload(p PurgePayload) ([]byte, error) {
 }
 
 func decodePurgePayload(b []byte) (PurgePayload, error) {
-	ID, err := uuid.FromBytes(b[:16])
+	idBytes, _, err := readN(b, 0, 16)
+	if err != nil {
+		return PurgePayload{}, err
+	}
+	ID, err := uuid.FromBytes(idBytes)
 	if err != nil {
 		return PurgePayload{}, err
 	}

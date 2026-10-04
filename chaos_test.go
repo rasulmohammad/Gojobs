@@ -88,3 +88,45 @@ func TestEndToEndCrashAtLeastOnce(t *testing.T) {
 		t.Fatalf("queue not drained: %d tasks remain", n)
 	}
 }
+
+// Same guarantees, but the system survives SEVERAL crash/restart cycles instead
+// of one. Each epoch runs workers on the current queue, crashes (stop all + wait),
+// then rebuilds from the WAL; the rebuilt queue is what the next epoch runs on.
+func TestEndToEndCrashMultipleRestarts(t *testing.T) {
+	q, path := newTestQueue(t)
+	store := newEffectStore()
+
+	keys := make([]string, 300)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("task-%d", i)
+	}
+	want := countDistinctKeys(keys)
+	produce(t, q, keys)
+
+	const epochs = 5
+	for e := 0; e < epochs; e++ {
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				consumeLoop(t, q, store, stop)
+			}()
+		}
+		time.Sleep(2 * time.Millisecond)
+		close(stop) // crash: stop every worker
+		wg.Wait()   // wait for them to exit before swapping the queue
+		q = reopenQueue(t, path)
+	}
+
+	// Finish anything still pending after the last restart.
+	drain(t, q, store)
+
+	if got := store.count(); got != want {
+		t.Fatalf("effects applied = %d, want %d", got, want)
+	}
+	if n := len(q.index); n != 0 {
+		t.Fatalf("queue not drained: %d tasks remain", n)
+	}
+}
