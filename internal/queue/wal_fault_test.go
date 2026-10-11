@@ -47,7 +47,7 @@ func TestAppendCrashIsAllOrNothing(t *testing.T) {
 			}
 			w.w = &failAfterWriter{under: w.w, budget: n} // swap the real writer for one that dies after n bytes
 
-			_, appendErr := w.Append(record)
+			appendErr := w.Append(record)
 			full := n == len(frame)
 
 			// Invariant A: a partial write fails closed (error returned, offset untouched).

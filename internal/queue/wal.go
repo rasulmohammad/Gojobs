@@ -25,9 +25,16 @@ type syncWriter interface {
 
 // This is the log manager. Owns file handle / how to append bytes. It is not an entry in the log
 type WAL struct {
-	w      syncWriter // where frames are written (a *os.File in production)
-	path   string     // file path, so Replay can reopen a fresh read handle
-	offset int64      // points to the end of the file
+	w          syncWriter       // where frames are written (a *os.File in production)
+	path       string           // file path, so Replay can reopen a fresh read handle
+	offset     int64            // points to the end of the file; mutated only by the writer goroutine
+	requests   chan *walRequest // producers submit append requests here; the single writer goroutine drains it
+	writerDone chan struct{}    // closed by the writer goroutine once it has drained and exited
+}
+
+type walRequest struct {
+	record                   []byte     // Raw bytes of our op
+	processedRequestsChannel chan error // Returns either an error or nil after append to WAL
 }
 
 // Open the WAL file so we can write in it
@@ -46,38 +53,102 @@ func OpenWAL(path string) (*WAL, error) {
 		return nil, err
 	}
 
-	return &WAL{w: f, path: path, offset: info.Size()}, nil
+	w := &WAL{
+		w:      f,
+		path:   path,
+		offset: info.Size(),
+		// Buffered so producers can deposit requests while the writer is busy
+		// fsync'ing the previous batch; that backlog is what a batch coalesces.
+		requests:   make(chan *walRequest, 1024),
+		writerDone: make(chan struct{}),
+	}
+	go w.run() // from here on, this goroutine is the only thing that touches the file
+	return w, nil
 }
 
-// Takes in the encoded record and writes it into our WAL
-// Returning offset could be good for steady-state (no crash) indexing
-func (w *WAL) Append(record []byte) (offset int64, err error) {
-	// 1. Encode the frame
-	frame, err := encodeFrame(record)
-	if err != nil {
-		return w.offset, err
+// run is the single writer goroutine. It is the ONLY thing that writes to or
+// fsyncs the file, so no lock guards w.w / w.offset. It coalesces every request
+// currently waiting into one batch, fsyncs once, then replies to every caller
+// in that batch. This is the group-commit optimization: N concurrent appends
+// cost one fsync instead of N. Exits when Close closes w.requests.
+func (w *WAL) run() {
+	defer close(w.writerDone)
+
+	for first := range w.requests {
+		// Start a batch with the request that woke us, then drain whatever else
+		// is already queued without blocking. Anything that piled up while the
+		// previous batch was fsync'ing gets folded into this one fsync.
+		batch := []*walRequest{first}
+	drain:
+		for {
+			select {
+			case req := <-w.requests:
+				batch = append(batch, req)
+			default:
+				break drain
+			}
+		}
+
+		// Write every frame to the OS page cache (not durable yet).
+		var batchErr error
+		for _, req := range batch {
+			frame, err := encodeFrame(req.record)
+			if err != nil {
+				batchErr = err
+				break
+			}
+			n, err := w.w.Write(frame)
+			if err != nil {
+				batchErr = err
+				break
+			}
+			w.offset += int64(n)
+		}
+
+		// One fsync makes the whole batch durable.
+		if batchErr == nil {
+			batchErr = w.w.Sync()
+		}
+
+		// Tell every caller the outcome. Their reply channels are buffered (cap 1),
+		// so this never blocks even if a caller isn't yet receiving.
+		// NOTE: on a mid-batch Write error the earlier frames in this batch were
+		// already written to the OS cache but we skip the fsync and fail everyone
+		// closed. Those un-fsync'd bytes may still reach disk later; a complete
+		// frame among them would be replayed even though its caller saw an error.
+		// Idempotency keys make that recoverable (the retry dedups). A real system
+		// would treat a WAL write error as fatal and halt; that's a later concern.
+		for _, req := range batch {
+			req.processedRequestsChannel <- batchErr
+		}
 	}
+}
 
-	start := w.offset
+// Takes in record bytes, creates a request to submit to WAL. Submits it to request channel for writer to process
+// Once it's been processed, we read the status of that task op
+func (w *WAL) Append(record []byte) error {
 
-	// 2. w.w.Write() to the file with the frame
-	n, err := w.w.Write(frame)
-	if err != nil {
-		return 0, err
+	req := &walRequest{
+		record:                   record,
+		processedRequestsChannel: make(chan error, 1),
 	}
+	w.requests <- req // blocks until we get output
+	err := <-req.processedRequestsChannel
+	return err
 
-	// Currently fsync per record. Lowest throughput though
-	// consider accumulating several appends and fsync'ing a batch.
-	// adds some latency due to postponing ack to consumer until the batch submission
-	err = w.w.Sync() // actually writes to disk. Write() writes to OS cache
-	if err != nil {
-		return 0, err
+}
+
+// Close shuts the writer down cleanly: stop accepting requests, let the writer
+// drain and fsync whatever is still queued, then close the file. The caller
+// must guarantee no Append runs after Close, since a send on a closed channel
+// panics (Queue.Close enforces this by stopping the sweeper first).
+func (w *WAL) Close() error {
+	close(w.requests) // run's `for range` drains the rest, fsyncs, then exits
+	<-w.writerDone    // wait for that final batch to be durable
+	if c, ok := w.w.(io.Closer); ok {
+		return c.Close()
 	}
-
-	// 3. Update w.offset by how many bytes you just wrote
-	w.offset += int64(n)
-	return start, nil // End of record position = start
-
+	return nil
 }
 
 // Replay means our memory queue died and we need to be able to read the record

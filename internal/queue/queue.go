@@ -211,13 +211,20 @@ func (q *Queue) runSweeper(interval time.Duration) {
 // Close actually stops our goroutines from processing, then waits for mid-process routines to finish. This is supposed to be invoked once we know we want to end the program / close queues, etc..
 func (q *Queue) Close() {
 	close(q.stop) // closes the channel stored in q.stop
-	q.wg.Wait()
+	q.wg.Wait()   // sweeper has fully exited, so no more Appends come from it
+	q.wal.Close() // now safe to stop the WAL writer; drains and fsyncs any final batch
 }
 
 // Enqueue creates the task, stores it into the data structures
 func (q *Queue) Enqueue(payload []byte, idemKey string) (uuid.UUID, error) {
 	q.mu.Lock()
-	defer q.mu.Unlock()
+	// We do this for dedup sake
+	if idemKey != "" {
+		if existing, ok := q.indexOfIdemKeys[idemKey]; ok {
+			q.mu.Unlock()
+			return *existing, nil // fast-path dedup
+		}
+	}
 
 	t := &Task{
 		ID:             uuid.New(),
@@ -225,12 +232,6 @@ func (q *Queue) Enqueue(payload []byte, idemKey string) (uuid.UUID, error) {
 		Payload:        payload,
 		Status:         StateReady,
 		EnqueuedAt:     time.Now(),
-	}
-
-	// Deduplicate task enqueue
-	_, ok := q.indexOfIdemKeys[idemKey]
-	if idemKey != "" && ok {
-		return *q.indexOfIdemKeys[idemKey], nil
 	}
 
 	// Write-ahead: durably record the enqueue before it exists in memory.
@@ -243,12 +244,25 @@ func (q *Queue) Enqueue(payload []byte, idemKey string) (uuid.UUID, error) {
 		Priority:       t.Priority,
 	})
 	if err != nil {
+		q.mu.Unlock() // still holding the lock from the top; release before bailing
 		return uuid.Nil, err
 	}
-	if _, err := q.wal.Append(encodeRecord(OperationEnqueue, fields)); err != nil {
+
+	// Append to WAL to handle fsync() submission
+	record := encodeRecord(OperationEnqueue, fields)
+	q.mu.Unlock() // unlock for durable append, allow multiple writes
+	if err := q.wal.Append(record); err != nil {
 		// Fail closed: the record isn't durable, so the task must not become
 		// visible. Return the error and touch nothing in memory.
 		return uuid.Nil, err
+	}
+
+	q.mu.Lock() // claim the lokc again
+	defer q.mu.Unlock()
+	if idemKey != "" {
+		if existing, ok := q.indexOfIdemKeys[idemKey]; ok {
+			return *existing, nil // someone won the race while we fsync'd
+		}
 	}
 
 	// The fsync succeeded, so the task is now durable. Only now do we make it
@@ -299,7 +313,7 @@ func Ack(q *Queue, id uuid.UUID) error {
 		return err
 	}
 	record := encodeRecord(OperationAck, fields)
-	_, err = q.wal.Append(record)
+	err = q.wal.Append(record)
 	if err != nil {
 		return err
 	}
@@ -344,7 +358,7 @@ func retryLocked(q *Queue, id uuid.UUID) error {
 			return err
 		}
 
-		_, err = q.wal.Append(encodeRecord(OperationDead, fields))
+		err = q.wal.Append(encodeRecord(OperationDead, fields))
 		if err != nil {
 			return err
 		}
@@ -360,7 +374,7 @@ func retryLocked(q *Queue, id uuid.UUID) error {
 			return err
 		}
 
-		_, err = q.wal.Append(encodeRecord(OperationRetry, fields))
+		err = q.wal.Append(encodeRecord(OperationRetry, fields))
 		if err != nil {
 			return err
 		}
@@ -451,7 +465,7 @@ func (q *Queue) RequeueDead(id uuid.UUID) error {
 	if err != nil {
 		return err
 	}
-	if _, err := q.wal.Append(encodeRecord(OperationRequeue, fields)); err != nil {
+	if err := q.wal.Append(encodeRecord(OperationRequeue, fields)); err != nil {
 		return err
 	}
 
@@ -480,7 +494,7 @@ func (q *Queue) PurgeDeadTask(id uuid.UUID) error {
 	if err != nil {
 		return err
 	}
-	if _, err := q.wal.Append(encodeRecord(OperationPurge, fields)); err != nil {
+	if err := q.wal.Append(encodeRecord(OperationPurge, fields)); err != nil {
 		return err
 	}
 

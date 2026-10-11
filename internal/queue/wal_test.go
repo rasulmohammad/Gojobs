@@ -152,10 +152,10 @@ func TestOpenWALReopenOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first OpenWAL error: %v", err)
 	}
-	if _, err := w1.Append([]byte("aaaa")); err != nil {
+	if err := w1.Append([]byte("aaaa")); err != nil {
 		t.Fatalf("Append error: %v", err)
 	}
-	if _, err := w1.Append([]byte("bbbbbb")); err != nil {
+	if err := w1.Append([]byte("bbbbbb")); err != nil {
 		t.Fatalf("Append error: %v", err)
 	}
 
@@ -168,8 +168,7 @@ func TestOpenWALReopenOffset(t *testing.T) {
 	}
 }
 
-// Append returns the start offset of each record and advances w.offset by the
-// full frame size (8-byte header + payload) each time.
+// Each Append advances w.offset by the full frame size (8-byte header + payload).
 func TestAppendOffsets(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "offsets.wal")
 	w, err := OpenWAL(path)
@@ -180,21 +179,11 @@ func TestAppendOffsets(t *testing.T) {
 	rec1 := []byte("hello")
 	rec2 := []byte("world!!")
 
-	off1, err := w.Append(rec1)
-	if err != nil {
+	if err := w.Append(rec1); err != nil {
 		t.Fatalf("first Append error: %v", err)
 	}
-	if off1 != 0 {
-		t.Errorf("first append start offset = %d, want 0", off1)
-	}
-
-	off2, err := w.Append(rec2)
-	if err != nil {
+	if err := w.Append(rec2); err != nil {
 		t.Fatalf("second Append error: %v", err)
-	}
-	wantOff2 := int64(8 + len(rec1))
-	if off2 != wantOff2 {
-		t.Errorf("second append start offset = %d, want %d", off2, wantOff2)
 	}
 
 	wantEnd := int64(8+len(rec1)) + int64(8+len(rec2))
@@ -219,7 +208,7 @@ func TestAppendReplayRoundTrip(t *testing.T) {
 		[]byte("ack-1"),
 	}
 	for _, rec := range records {
-		if _, err := w.Append(rec); err != nil {
+		if err := w.Append(rec); err != nil {
 			t.Fatalf("Append(%q) error: %v", rec, err)
 		}
 	}
@@ -277,7 +266,7 @@ func TestReplayTruncatedTail(t *testing.T) {
 
 	records := [][]byte{[]byte("aaaa"), []byte("bbbb"), []byte("cccc")}
 	for _, rec := range records {
-		if _, err := w.Append(rec); err != nil {
+		if err := w.Append(rec); err != nil {
 			t.Fatalf("Append(%q): %v", rec, err)
 		}
 	}
@@ -308,10 +297,10 @@ func TestReplayCorruptTailCRC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
 	}
-	if _, err := w.Append([]byte("first")); err != nil {
+	if err := w.Append([]byte("first")); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	if _, err := w.Append([]byte("second")); err != nil {
+	if err := w.Append([]byte("second")); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 
