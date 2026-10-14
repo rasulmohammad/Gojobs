@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"container/heap"
 	"fmt"
 	"math"
 	"math/rand"
@@ -17,12 +18,12 @@ const (
 	maxDelay  = 30 * time.Second
 )
 
-// ready is our FIFO queue to deliver the next task via Dequeue()
-// index is our lookup: an ID maps to a task for O(1) lookup
+// ready is a min-heap (by AvailableAt) of deliverable tasks; Dequeue pops the
+// soonest-available one. index is our lookup: an ID maps to a task for O(1) lookup
 // wal is the durable log; every mutation is appended (and fsync'd) here
 // before it becomes visible in memory.
 type Queue struct {
-	ready             []*Task
+	ready             readyHeap // min-heap keyed by AvailableAt; root is the soonest-available task
 	index             map[uuid.UUID]*Task
 	indexOfInflight   map[uuid.UUID]*Task
 	indexOfIdemKeys   map[string]*uuid.UUID // Deduplicating task entries into queue
@@ -68,6 +69,10 @@ func NewQueue(walPath string, visibilityTimeout, sweepInterval time.Duration, ma
 	if err = w.Replay(q.applyRecord); err != nil {
 		return nil, err
 	}
+
+	// Replay rebuilds q.ready as a plain append-ordered slice (and removes acked/
+	// dead tasks by ID), so restore the heap invariant once before serving.
+	heap.Init(&q.ready)
 
 	// Starts the background sweeper. Non-blocking, NewQueue continues to return q, nil instantly after runSweeper
 	// integer 1 here represents total amount of routines we want to wait for
@@ -267,36 +272,35 @@ func (q *Queue) Enqueue(payload []byte, idemKey string) (uuid.UUID, error) {
 
 	// The fsync succeeded, so the task is now durable. Only now do we make it
 	// visible in memory; if we crashed right here, replay would rebuild it.
-	q.ready = append(q.ready, t)
+	heap.Push(&q.ready, t)
 	q.index[t.ID] = t
 	q.indexOfIdemKeys[idemKey] = &t.ID
 
 	return t.ID, nil
 }
 
-// Dequeue pops the task from the front of the ready slice & updates status. True = Successful pop
+// Dequeue hands back the soonest-available task, or (nil,false) if none is due.
+// The ready set is a min-heap keyed on AvailableAt, so the root is always the
+// earliest-available task: if the root isn't due yet, nothing is, and we return
+// in O(1) instead of scanning past every backed-off task. Popping the due task
+// is O(log n).
 func (q *Queue) Dequeue() (*Task, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	// Ensuring non-empty array
 	now := time.Now()
-	for i, t := range q.ready {
-		// Only process tasks that are ready
-		if t.AvailableAt.After(now) {
-			continue
-		}
 
-		// We have a ready task
-		q.ready = append(q.ready[:i], q.ready[i+1:]...)
-
-		// Updating task itself since map holds a pointer to it
-		t.Status = StateInflight
-		t.LeaseUntil = now.Add(q.visibilityTimeout)
-		q.indexOfInflight[t.ID] = t
-		return t, true, nil
+	// Peek the root. Empty, or the soonest task still in the future => nothing due.
+	if len(q.ready) == 0 || q.ready[0].AvailableAt.After(now) {
+		return nil, false, nil
 	}
 
-	return nil, false, nil
+	t := heap.Pop(&q.ready).(*Task)
+
+	// Updating task itself since map holds a pointer to it
+	t.Status = StateInflight
+	t.LeaseUntil = now.Add(q.visibilityTimeout)
+	q.indexOfInflight[t.ID] = t
+	return t, true, nil
 }
 
 // Consumer uses Ack() when successfully finishes the task
@@ -381,7 +385,7 @@ func retryLocked(q *Queue, id uuid.UUID) error {
 
 		t.Status = StateReady
 		t.AvailableAt = time.Now().Add(generateBackoff(t.Retries))
-		q.ready = append(q.ready, t)
+		heap.Push(&q.ready, t)
 
 	}
 	t.Retries += 1
@@ -476,7 +480,7 @@ func (q *Queue) RequeueDead(id uuid.UUID) error {
 	t.FailedAt = time.Time{}
 	delete(q.dlq, id)
 	q.index[id] = t
-	q.ready = append(q.ready, t)
+	heap.Push(&q.ready, t)
 	return nil
 }
 
