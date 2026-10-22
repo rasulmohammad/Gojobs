@@ -9,6 +9,16 @@ rebuilds itself by replaying the log. Delivery is at-least-once (a dequeued but
 un-acked task comes back as ready) and made effectively-once via enqueue
 deduplication plus idempotent consumers.
 
+## Why? 
+
+I spent 2 summers interning at AWS working with distributed systems at scale. My most recent experience had me replace an entire architecture and implement one of my own. A major focal point of that implementation process was recognizing when/where the system can fail, and how to handle those failure modes. I quickly realized that implementing an LLM-based solution wasn't as hard as knowing exactly what to write first, and to understand the systems at play, I rebuilt a very common one from the ground up in this very repo.
+
+Coincidentally, the architecture I replaced relied heavily on SQS Message queues. From that point on, I had a project: rebuild a task queue from scratch, handling auto-retries, DLQs, priority queues, concurrency, and durability. 
+
+The challenge for this project was simple:
+1. NO hard dependencies. Using any external libraries that simplified this project would only stunt my understanding of the raw system. The only dependency I allowed myself to use was Google's UUID library for task IDs
+2. Complete this project in Go: a language that seemed fitting due to its concurrency model, but also a language I've never coded in before.
+
 ## Architecture
 
 ```mermaid
